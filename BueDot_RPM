@@ -1,0 +1,174 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from pathlib import Path
+
+
+# ----------------------
+# Variables
+# ----------------------
+D=1.2 # Rotor diameter in meters
+R=D/2 # Rotor radius in meters
+A=np.pi*R**2 # Swept area in m^2
+rho=1.225 # Air density in kg/m^3
+g=9.81 # Gravitational acceleration in m/s^2
+dist=4 # Distance between turbines 
+# ----------------------
+# ----------------------
+# Simulation parameters
+# ----------------------
+t_end = 60.0         # [s]
+dt = 0.01            # [s]
+t = np.arange(0, t_end + dt, dt)
+
+# Wind (start simple: constant)
+V = 8.0 * np.ones_like(t)   # [m/s]
+
+# Rotor inertias (guesses; tune later)
+J1 = 0.25   # [kg m^2]
+J2 = 0.27   # [kg m^2]  # make them slightly different on purpose
+
+# Mechanical losses (simple viscous friction)
+c_fric1 = 0.02   # [N m s]
+c_fric2 = 0.02
+
+# Generator "electrical braking" model:
+# Q_gen = k_elec(u) * Omega, where u in [0,1]
+k_elec_min = 0.01   # [N m s]  (almost open-circuit)
+k_elec_max = 0.25   # [N m s]  (heavy electrical loading)
+
+# Strategy A controller
+u_base = 0.35       # baseline loading (common mode)
+Kp_sync = 0.015     # sync gain (tune)
+
+u_min, u_max = 0.0, 1.0
+
+# Small epsilon to avoid division by zero
+eps = 1e-6
+
+# ----------------------
+# Aerodynamics: choose a simple Cp(lambda) shape
+# ----------------------
+def cp_lambda(lam, cp_max=0.35, lam_opt=6.0, width=2.5):
+    """
+    Simple bell-shaped Cp curve with peak cp_max at lam_opt.
+    Not 'true' BEM, but good enough for control prototyping.
+    """
+    lam = np.maximum(lam, 0.0)
+    return cp_max * np.exp(-((lam - lam_opt) / width)**2)
+
+# Optional: Ct(lambda) for later yaw moment calculations
+def ct_lambda(lam, ct_max=0.9, lam_opt=6.0, width=3.0, ct_min=0.2):
+    lam = np.maximum(lam, 0.0)
+    return ct_min + (ct_max - ct_min) * np.exp(-((lam - lam_opt) / width)**2)
+
+# ----------------------
+# Allocate arrays
+# ----------------------
+Omega1 = np.zeros_like(t)   # [rad/s]
+Omega2 = np.zeros_like(t)
+
+u1 = np.zeros_like(t)
+u2 = np.zeros_like(t)
+
+lam1 = np.zeros_like(t)
+lam2 = np.zeros_like(t)
+
+Pa1 = np.zeros_like(t)      # aerodynamic power [W]
+Pa2 = np.zeros_like(t)
+
+Qg1 = np.zeros_like(t)      # generator torque [N m]
+Qg2 = np.zeros_like(t)
+
+Qa1 = np.zeros_like(t)      # aerodynamic torque [N m]
+Qa2 = np.zeros_like(t)
+
+# Initial conditions (start from rest)
+Omega1[0] = 0.5
+Omega2[0] = 0.2
+
+# ----------------------
+# Time stepping loop (forward Euler)
+# ----------------------
+for k in range(len(t) - 1):
+    Vk = V[k]
+
+    # Tip-speed ratios
+    lam1[k] = Omega1[k] * R / (Vk + eps)
+    lam2[k] = Omega2[k] * R / (Vk + eps)
+
+    # Aerodynamic power from Cp
+    Cp1 = cp_lambda(lam1[k])
+    Cp2 = cp_lambda(lam2[k])
+
+    Pa1[k] = 0.5 * rho * A * Vk**3 * Cp1
+    Pa2[k] = 0.5 * rho * A * Vk**3 * Cp2
+
+    # Aerodynamic torque: P = Q * Omega  => Q = P/Omega
+    Qa1[k] = Pa1[k] / (Omega1[k] + eps)
+    Qa2[k] = Pa2[k] / (Omega2[k] + eps)
+
+    # --- Strategy A control: match Omega1 and Omega2 ---
+    
+
+    dOmega = Omega1[k] - Omega2[k]
+
+    u1_cmd = u_base + Kp_sync * dOmega
+    u2_cmd = u_base - Kp_sync * dOmega
+
+    # saturate
+    u1[k] = np.clip(u1_cmd, u_min, u_max)
+    u2[k] = np.clip(u2_cmd, u_min, u_max)
+
+    # Electrical damping coefficient as function of u
+    k1 = k_elec_min + (k_elec_max - k_elec_min) * u1[k]
+    k2 = k_elec_min + (k_elec_max - k_elec_min) * u2[k]
+
+    # Generator torque (electrical braking)
+    Qg1[k] = k1 * Omega1[k]
+    Qg2[k] = k2 * Omega2[k]
+
+    # Friction torque
+    Qf1 = c_fric1 * Omega1[k]
+    Qf2 = c_fric2 * Omega2[k]
+
+    # Rotor dynamics
+    dOmega1 = (Qa1[k] - Qg1[k] - Qf1) / J1
+    dOmega2 = (Qa2[k] - Qg2[k] - Qf2) / J2
+
+    # Integrate
+    Omega1[k+1] = max(0.0, Omega1[k] + dt * dOmega1)
+    Omega2[k+1] = max(0.0, Omega2[k] + dt * dOmega2)
+
+# fill last samples for plotting
+lam1[-1] = Omega1[-1] * R / (V[-1] + eps)
+lam2[-1] = Omega2[-1] * R / (V[-1] + eps)
+u1[-1] = u1[-2]
+u2[-1] = u2[-2]
+
+# ----------------------
+# Plots
+# ----------------------
+rpm1 = Omega1 * 60 / (2*np.pi)
+rpm2 = Omega2 * 60 / (2*np.pi)
+
+plt.figure()
+plt.grid(True)
+plt.plot(t, rpm1, label="RPM 1")
+plt.plot(t, rpm2, label="RPM 2")
+plt.xlabel("Time [s]")
+plt.ylabel("Rotor speed [RPM]")
+plt.title("Strategy A: RPM synchronization")
+plt.legend()
+
+plt.figure()
+plt.grid(True)
+plt.plot(t, u1, label="u1 (load cmd)")
+plt.plot(t, u2, label="u2 (load cmd)")
+plt.xlabel("Time [s]")
+plt.ylabel("Load command u [-]")
+plt.title("Differential loading used to match RPM")
+plt.legend()
+
+plt.show()
+

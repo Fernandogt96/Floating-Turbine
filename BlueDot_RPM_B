@@ -1,0 +1,237 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from pathlib import Path
+
+# ----------------------
+# Constants / geometry
+# ----------------------
+D = 1.2
+R = D / 2
+A = np.pi * R**2
+rho = 1.225
+dist = 4.0  # hub-to-hub distance [m]
+b = dist
+
+# ----------------------
+# Simulation parameters
+# ----------------------
+t_end = 60.0
+dt = 0.01
+t = np.arange(0, t_end + dt, dt)
+
+V = 8.0 * np.ones_like(t)  # constant wind [m/s]
+eps = 1e-6
+
+# ----------------------
+# Rotor inertias + losses (guesses)
+# ----------------------
+J1, J2 = 0.25, 0.27          # [kg m^2]
+c_fric1, c_fric2 = 0.02, 0.02  # viscous friction [N m s]
+
+# ----------------------
+# Generator "electrical braking": Q_gen = k_elec(u) * Omega
+# ----------------------
+k_elec_min = 0.01
+k_elec_max = 0.25
+
+u_min, u_max = 0.0, 1.0
+
+# ----------------------
+# Aerodynamic coefficient models (simple but stable)
+# ----------------------
+def cp_lambda(lam, cp_max=0.35, lam_opt=6.0):
+    """
+    Starter-friendly Cp curve with peak at lam_opt and non-crazy behavior at low lam.
+    """
+    lam = np.maximum(lam, 0.0)
+    x = (lam + 1e-6) / lam_opt
+    return cp_max * x * np.exp(1 - x)
+
+def ct_lambda(lam, ct_max=0.9, lam0=2.0):
+    """
+    Simple Ct curve: higher Ct at low TSR, decreasing with TSR.
+    This is closer to the intuition that "stalled/slow" rotors have higher thrust.
+    """
+    lam = np.maximum(lam, 0.0)
+    return ct_max / (1.0 + (lam / lam0)**2)
+
+# ----------------------
+# Platform yaw dynamics parameters (guesses)
+# ----------------------
+Ipsi = 20.0     # yaw inertia [kg m^2] (tune)
+cpsi = 8.0      # yaw damping [N m s] (tune)
+kpsi = 0.0      # yaw restoring [N m/rad] (0 if "free swivel"; increase if mooring restores)
+
+# ----------------------
+# Strategy B controller (Yaw feedback)
+# ----------------------
+u_base = 0.35       # common-mode load
+Kp_yaw = 0.25       # proportional yaw gain  [1/rad] -> produces u_diff
+Kd_yaw = 0.10       # derivative yaw gain    [s/rad]
+u_diff_limit = 0.25 # max differential load magnitude (keeps u1,u2 reasonable)
+
+# ----------------------
+# Allocate arrays
+# ----------------------
+Omega1 = np.zeros_like(t)
+Omega2 = np.zeros_like(t)
+
+psi = np.zeros_like(t)       # yaw angle [rad] (0 = aligned)
+psi_dot = np.zeros_like(t)   # yaw rate [rad/s]
+
+u1 = np.zeros_like(t)
+u2 = np.zeros_like(t)
+
+lam1 = np.zeros_like(t)
+lam2 = np.zeros_like(t)
+
+Ft1 = np.zeros_like(t)
+Ft2 = np.zeros_like(t)
+Myaw = np.zeros_like(t)
+
+Qa1 = np.zeros_like(t)
+Qa2 = np.zeros_like(t)
+Qg1 = np.zeros_like(t)
+Qg2 = np.zeros_like(t)
+
+# Initial conditions (create some imbalance)
+Omega1[0] = 0.5
+Omega2[0] = 0.2
+psi[0] = np.deg2rad(10.0)     # start 10 deg misaligned (so we see controller act)
+psi_dot[0] = 0.0
+
+# ----------------------
+# Time stepping loop
+# ----------------------
+for k in range(len(t) - 1):
+    Vk = V[k]
+
+    # Tip-speed ratio
+    lam1[k] = Omega1[k] * R / (Vk + eps)
+    lam2[k] = Omega2[k] * R / (Vk + eps)
+
+    # Aerodynamic Cp, Ct
+    Cp1 = cp_lambda(lam1[k])
+    Cp2 = cp_lambda(lam2[k])
+    Ct1 = ct_lambda(lam1[k])
+    Ct2 = ct_lambda(lam2[k])
+
+    # Aero power
+    Pa1 = 0.5 * rho * A * Vk**3 * Cp1
+    Pa2 = 0.5 * rho * A * Vk**3 * Cp2
+
+    # Aero torque using Cq = Cp/lambda and Q = 0.5*rho*A*R*V^2*Cq
+    Cq1 = Cp1 / (lam1[k] + 1e-3)
+    Cq2 = Cp2 / (lam2[k] + 1e-3)
+    Qa1[k] = 0.5 * rho * A * R * Vk**2 * Cq1
+    Qa2[k] = 0.5 * rho * A * R * Vk**2 * Cq2
+
+    # Thrust
+    Ft1[k] = 0.5 * rho * A * Vk**2 * Ct1
+    Ft2[k] = 0.5 * rho * A * Vk**2 * Ct2
+
+    # Yaw moment from thrust imbalance
+    Myaw[k] = (b / 2.0) * (Ft1[k] - Ft2[k])
+
+    # ----------------------
+    # Strategy B: yaw PD controller -> differential load
+    # Negative feedback to drive psi -> 0
+    # ----------------------
+    u_diff_cmd = -(Kp_yaw * psi[k] + Kd_yaw * psi_dot[k])
+    u_diff_cmd = np.clip(u_diff_cmd, -u_diff_limit, u_diff_limit)
+
+    u1_cmd = u_base + u_diff_cmd
+    u2_cmd = u_base - u_diff_cmd
+
+    u1[k] = np.clip(u1_cmd, u_min, u_max)
+    u2[k] = np.clip(u2_cmd, u_min, u_max)
+
+    # Electrical damping coefficients
+    k1 = k_elec_min + (k_elec_max - k_elec_min) * u1[k]
+    k2 = k_elec_min + (k_elec_max - k_elec_min) * u2[k]
+
+    # Generator torques
+    Qg1[k] = k1 * Omega1[k]
+    Qg2[k] = k2 * Omega2[k]
+
+    # Friction torques
+    Qf1 = c_fric1 * Omega1[k]
+    Qf2 = c_fric2 * Omega2[k]
+
+    # Rotor accelerations
+    dOmega1 = (Qa1[k] - Qg1[k] - Qf1) / J1
+    dOmega2 = (Qa2[k] - Qg2[k] - Qf2) / J2
+
+    Omega1[k+1] = max(0.0, Omega1[k] + dt * dOmega1)
+    Omega2[k+1] = max(0.0, Omega2[k] + dt * dOmega2)
+
+    # Platform yaw dynamics
+    psi_ddot = (Myaw[k] - cpsi * psi_dot[k] - kpsi * psi[k]) / Ipsi
+    psi_dot[k+1] = psi_dot[k] + dt * psi_ddot
+    psi[k+1] = psi[k] + dt * psi_dot[k+1]  # semi-implicit for a bit more stability
+
+# Fill last samples for plotting
+lam1[-1] = Omega1[-1] * R / (V[-1] + eps)
+lam2[-1] = Omega2[-1] * R / (V[-1] + eps)
+u1[-1] = u1[-2]
+u2[-1] = u2[-2]
+Ft1[-1] = Ft1[-2]
+Ft2[-1] = Ft2[-2]
+Myaw[-1] = Myaw[-2]
+
+# ----------------------
+# Plots (saved to files)
+# ----------------------
+rpm1 = Omega1 * 60 / (2*np.pi)
+rpm2 = Omega2 * 60 / (2*np.pi)
+psi_deg = np.rad2deg(psi)
+
+plt.figure()
+plt.grid(True)
+plt.plot(t, rpm1, label="RPM 1")
+plt.plot(t, rpm2, label="RPM 2")
+plt.xlabel("Time [s]")
+plt.ylabel("Rotor speed [RPM]")
+plt.title("Strategy B: rotor speeds (not necessarily equal)")
+plt.legend()
+plt.tight_layout()
+plt.savefig("B_rpm.png", dpi=200)
+
+plt.figure()
+plt.grid(True)
+plt.plot(t, psi_deg, label="Yaw angle ψ [deg]")
+plt.xlabel("Time [s]")
+plt.ylabel("ψ [deg]")
+plt.title("Strategy B: yaw angle response")
+plt.legend()
+plt.tight_layout()
+plt.savefig("B_yaw.png", dpi=200)
+
+plt.figure()
+plt.grid(True)
+plt.plot(t, u1, label="u1 (load cmd)")
+plt.plot(t, u2, label="u2 (load cmd)")
+plt.xlabel("Time [s]")
+plt.ylabel("u [-]")
+plt.title("Strategy B: differential loading from yaw feedback")
+plt.legend()
+plt.tight_layout()
+plt.savefig("B_u.png", dpi=200)
+
+plt.figure()
+plt.grid(True)
+plt.plot(t, Myaw, label="Yaw moment Myaw [N·m]")
+plt.xlabel("Time [s]")
+plt.ylabel("Myaw [N·m]")
+plt.title("Yaw moment generated by thrust imbalance")
+plt.legend()
+plt.tight_layout()
+plt.savefig("B_myaw.png", dpi=200)
+
+plt.show()
+
+
+print("Saved plots: B_rpm.png, B_yaw.png, B_u.png, B_myaw.png")
+print(f"Final yaw angle: {psi_deg[-1]:.3f} deg")
+print(f"Final RPMs: RPM1={rpm1[-1]:.2f}, RPM2={rpm2[-1]:.2f}")
